@@ -40,6 +40,7 @@ RISK_PHONE = 7
 RISK_TALKING = 3
 RISK_EMOTION_FATIGUE = 4
 RISK_HIGH_FATIGUE = 6
+RISK_PASSENGER = 3
 
 # MediaPipe Setup
 LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
@@ -237,6 +238,8 @@ class DriverMonitoringSystem:
         self.phone_detected = False
         self.talking_flag = False
         self.current_emotion = "neutral"
+        self.fatigue_flag = False
+        self.passenger_detected = False
 
     def trigger_alert(self, alert_type, message, priority_level):
         """
@@ -265,15 +268,13 @@ class DriverMonitoringSystem:
     def process_logic_and_alerts(self, risk_score):
         # PRIORITY ORDER: 
         # 1. High Risk (Generic or Specific)
-        # 2. Phone
-        # 3. Drowsy
-        # 4. Distraction
-        # 5. Talking
-        # 6. Emotion
-        
-        # We check conditions in priority order. 
-        # If a higher priority condition triggers a voice alert, we stop checking lower ones for this frame 
-        # (to avoid double speaking), BUT we only block if a speak actually happened.
+        # 2. Fatigue (New Fusion)
+        # 3. Phone
+        # 4. Passenger (New)
+        # 5. Drowsy
+        # 6. Looking Away (Distraction)
+        # 7. Talking
+        # 8. Emotion
         
         spoken = False
 
@@ -281,25 +282,33 @@ class DriverMonitoringSystem:
         if risk_score >= 11:
             spoken = self.trigger_alert("HIGH_RISK", "High risk detected. Drive carefully.", 1)
         
-        # 2. Phone
+        # 2. Fatigue
+        if not spoken and self.fatigue_flag:
+            spoken = self.trigger_alert("FATIGUE", "You appear tired. Please take a break.", 2)
+            
+        # 3. Phone
         if not spoken and self.phone_detected:
-            spoken = self.trigger_alert("PHONE", "Phone usage detected. Please focus on driving.", 2)
+            spoken = self.trigger_alert("PHONE", "Phone usage detected. Please focus on driving.", 3)
             
-        # 3. Drowsy
+        # 4. Passenger
+        if not spoken and self.passenger_detected:
+            spoken = self.trigger_alert("PASSENGER", "Passengers, please do not disturb the driver.", 4)
+            
+        # 5. Drowsy (Fallback)
         if not spoken and self.drowsy_flag:
-            spoken = self.trigger_alert("DROWSY", "You seem sleepy. Please stay alert.", 3)
+            spoken = self.trigger_alert("DROWSY", "You seem sleepy. Please stay alert.", 5)
             
-        # 4. Looking Away
+        # 6. Looking Away
         if not spoken and self.is_distracted:
-            spoken = self.trigger_alert("DISTRACTION", "Please keep your eyes on the road.", 4)
+            spoken = self.trigger_alert("LOOKING_AWAY", "Please keep your eyes on the road.", 6)
             
-        # 5. Talking
+        # 7. Talking
         if not spoken and self.talking_flag:
-            spoken = self.trigger_alert("TALKING", "Please reduce conversation and focus on driving.", 5)
+            spoken = self.trigger_alert("TALKING", "Please reduce conversation and focus on driving.", 7)
             
-        # 6. Emotion (Tired)
+        # 8. Emotion (Tired)
         if not spoken and self.current_emotion in ['sad', 'fear']:
-            spoken = self.trigger_alert("EMOTION", "You look tired. Consider taking a short break.", 6)
+            spoken = self.trigger_alert("EMOTION", "You look tired. Consider taking a short break.", 8)
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -371,21 +380,42 @@ class DriverMonitoringSystem:
                         if res: self.current_emotion = res[0]['dominant_emotion']
                 except: pass
 
-            # --- YOLO PHONE ---
+            # --- YOLO PHONE & PERSON ---
             self.phone_detected = False
+            self.passenger_detected = False
+            person_count = 0
+
             if self.yolo:
                 try:
-                    results = self.yolo(frame, verbose=False, classes=[67], conf=0.4)
+                    # Detect Person (0) and Cell Phone (67)
+                    results = self.yolo(frame, verbose=False, classes=[0, 67], conf=0.4)
                     for r in results:
                         for box in r.boxes:
+                            cls = int(box.cls[0])
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 2)
-                            cv2.putText(frame, "PHONE", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-                            self.phone_detected = True
+                            
+                            if cls == 0: # Person
+                                person_count += 1
+                                # Draw person box slightly different if needed, or just let it trigger
+                                # cv2.rectangle(frame, (x1, y1), (x2, y2), (255,100,0), 1)
+                            
+                            elif cls == 67: # Phone
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 2)
+                                cv2.putText(frame, "PHONE", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+                                self.phone_detected = True
+                    
+                    if person_count > 1:
+                        self.passenger_detected = True
+
                 except: pass
 
             # --- TALKING ---
             self.talking_flag = self.audio.is_talking_excessively
+
+            # --- FATIGUE FUSION ---
+            self.fatigue_flag = False
+            if self.drowsy_flag or (self.current_emotion in ['sad', 'fear']):
+                self.fatigue_flag = True
 
             # --- SCORING ---
             risk_score = 0
@@ -394,6 +424,7 @@ class DriverMonitoringSystem:
             if self.phone_detected: risk_score += RISK_PHONE
             if self.talking_flag: risk_score += RISK_TALKING
             if self.current_emotion in ['sad', 'fear']: risk_score += RISK_EMOTION_FATIGUE
+            if self.passenger_detected: risk_score += RISK_PASSENGER
             
             # --- PROCESS ALERTS ---
             self.process_logic_and_alerts(risk_score)
@@ -419,6 +450,10 @@ class DriverMonitoringSystem:
             cv2.rectangle(frame, (230, y-15), (330, y-5), (255,255,255), 1)
             
             y+=30; draw_text(frame, f"Phone: {'YES' if self.phone_detected else 'NO'}", (10,y), (0,0,255) if self.phone_detected else (0,255,0))
+            y+=30; draw_text(frame, f"Passenger: {'YES' if self.passenger_detected else 'NO'}", (10,y), (0,0,255) if self.passenger_detected else (0,255,0))
+            
+            if self.passenger_detected:
+                cv2.putText(frame, "PASSENGER DETECTED", (320, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,140,255), 2)
             y+=30; draw_text(frame, f"Score: {risk_score}", (10,y), col)
             y+=30; draw_text(frame, f"Level: {lev}", (10,y), col)
 
